@@ -12,7 +12,7 @@ from fake_useragent import FakeUserAgent
 from http.cookies import SimpleCookie
 from datetime import datetime, timezone
 from colorama import *
-import asyncio, binascii, random, time, json, re, os, pytz
+import asyncio, binascii, random, json, re, os, pytz
 
 load_dotenv()
 
@@ -216,6 +216,7 @@ class KiteAI:
         self.BRIDGE_API = "https://bridge-backend.prod.gokite.ai"
         self.NEO_API = "https://neo.prod.gokite.ai"
         self.OZONE_API = "https://ozone-point-system.prod.gokite.ai"
+        self.MULTISIG_API = "https://wallet-client.ash.center/v1"
         self.FAUCET_SITE_KEY = "6LeNaK8qAAAAAHLuyTlCrZD_U1UoFLcCTLoa_69T"
         self.TESTNET_SITE_KEY = "6Lc_VwgrAAAAALtx_UtYQnW-cFg8EPDgJ8QVqkaz"
         self.CAPTCHA_KEY = None
@@ -231,13 +232,34 @@ class KiteAI:
         self.access_tokens = {}
         self.aa_address = {}
 
+
+        self.stake_amount = 0.2  # 质押数量
+        self.unstake_amount = 1 # 解押数量
+        self.min_delay = 5
+        self.max_delay = 10
+        self.ai_chat_count = 10 # ai聊天次数
+        self.multisig_count = 2
+        self.swap_count = 4 # 随机swap次数
+        self.kite_swap_amount = 1
+        self.usdt_swap_amount = 1
+        self.bridge_count = 2
+        self.usdt_bridge_amount = 0.5
+        self.kite_bridge_amount = 0.1
+        self.eth_bridge_amount = 0.001
+
+        # 初始化执行报告
+        self.execution_report = {}
+
+        self.concurrent_count = 5  #  账号并发数
+
     def clear_terminal(self):
         os.system('cls' if os.name == 'nt' else 'clear')
+
 
     def log(self, message):
         print(
             f"{Fore.CYAN + Style.BRIGHT}[ {datetime.now().astimezone(wib).strftime('%x %X %Z')} ]{Style.RESET_ALL}"
-            f"{Fore.WHITE + Style.BRIGHT} | {Style.RESET_ALL}{message}",
+            f"{Fore.YELLOW + Style.BRIGHT} | {Style.RESET_ALL}{message}",
             flush=True
         )
 
@@ -295,7 +317,7 @@ class KiteAI:
 
             self.log(
                 f"{Fore.GREEN + Style.BRIGHT}Proxies Total  : {Style.RESET_ALL}"
-                f"{Fore.WHITE + Style.BRIGHT}{len(self.proxies)}{Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT}{len(self.proxies)}{Style.RESET_ALL}"
             )
         
         except Exception as e:
@@ -487,29 +509,11 @@ class KiteAI:
             "amount": amount
         }
     
-    async def get_web3_with_check(self, address: str, rpc_url: str, use_proxy: bool, retries=3, timeout=60):
-        request_kwargs = {"timeout": timeout}
-
-        proxy = self.get_next_proxy_for_account(address) if use_proxy else None
-
-        if use_proxy and proxy:
-            request_kwargs["proxies"] = {"http": proxy, "https": proxy}
-
-        for attempt in range(retries):
-            try:
-                web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
-                web3.eth.get_block_number()
-                return web3
-            except Exception as e:
-                if attempt < retries:
-                    await asyncio.sleep(3)
-                    continue
-                raise Exception(f"Failed to Connect to RPC: {str(e)}")
+    
         
-    async def get_token_balance(self, address: str, rpc_url: str, contract_address: str, token_type: str, use_proxy: bool):
+    async def get_token_balance(self, address: str, rpc_url: str, contract_address: str, token_type: str, proxy_url: str):
         try:
-            web3 = await self.get_web3_with_check(address, rpc_url, use_proxy)
-
+            web3 = await self.get_web3_with_check(address, rpc_url, proxy_url)
             if token_type == "native":
                 balance = web3.eth.get_balance(address)
                 decimals = 18
@@ -624,47 +628,11 @@ class KiteAI:
         except Exception as e:
             raise Exception(f"Built Initializer Data Failed: {str(e)}")
     
-    async def perform_create_proxy(self, account: str, address: str, use_proxy: bool):
-        try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI['rpc_url'], use_proxy)
-
-            initializer = self.build_initializer_data(address)
-
-            salt_nonce = int(time.time())
-
-            token_contract = web3.eth.contract(address=web3.to_checksum_address(self.SAFE_PROXY_FACTORY_ADDRESS), abi=self.ERC20_CONTRACT_ABI)
-            create_proxy_data = token_contract.functions.createProxyWithNonce(self.GNOSIS_SAFE_L2_ADDRESS, initializer, salt_nonce)
-            
-            proxy_address = create_proxy_data.call({"from": address})
-
-            estimated_gas = create_proxy_data.estimate_gas({"from": address})
-            max_priority_fee = web3.to_wei(0.001, "gwei")
-            max_fee = max_priority_fee
-
-            create_proxy_tx = create_proxy_data.build_transaction({
-                "from": address,
-                "gas": int(estimated_gas * 1.2),
-                "maxFeePerGas": int(max_fee),
-                "maxPriorityFeePerGas": int(max_priority_fee),
-                "nonce": web3.eth.get_transaction_count(address, "pending"),
-                "chainId": web3.eth.chain_id,
-            })
-
-            tx_hash = await self.send_raw_transaction_with_retries(account, web3, create_proxy_tx)
-            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
-            block_number = receipt.blockNumber
-
-            return tx_hash, block_number, proxy_address
-        except Exception as e:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Message : {Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-            )
-            return None, None, None
     
-    async def approving_token(self, account: str, address: str, rpc_url: str, spender_address: str, contract_address: str, amount_to_wei: int, explorer: str, use_proxy: bool):
+    
+    async def approving_token(self, account: str, address: str, rpc_url: str, spender_address: str, contract_address: str, amount_to_wei: int, explorer: str, proxy_url: str):
         try:
-            web3 = await self.get_web3_with_check(address, rpc_url, use_proxy)
+            web3 = await self.get_web3_with_check(address, rpc_url, proxy_url)
             
             spender = web3.to_checksum_address(spender_address)
             token_contract = web3.eth.contract(address=web3.to_checksum_address(contract_address), abi=self.ERC20_CONTRACT_ABI)
@@ -696,15 +664,15 @@ class KiteAI:
                 )
                 self.log(
                     f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
                 )
                 self.log(
                     f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
                 )
                 self.log(
                     f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{explorer}{tx_hash}{Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{explorer}{tx_hash}{Style.RESET_ALL}"
                 )
                 await self.print_timer("Transactions")
             
@@ -743,68 +711,11 @@ class KiteAI:
         except Exception as e:
             raise Exception(f"Built Instructions Data Failed: {str(e)}")
 
-    async def perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float, use_proxy: bool):
-        try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
-
-            amount_to_wei = web3.to_wei(amount, "ether")
-
-            if swap_type == "native to erc20":
-                token_contract = web3.eth.contract(address=web3.to_checksum_address(self.SWAP_ROUTER_ADDRESS), abi=self.NATIVE_CONTRACT_ABI)
-
-            elif swap_type == "erc20 to native":
-                await self.approving_token(
-                    account, address, self.KITE_AI["rpc_url"], self.SWAP_ROUTER_ADDRESS, token_in, amount_to_wei, self.KITE_AI["explorer"], use_proxy
-                )
-                token_contract = web3.eth.contract(address=web3.to_checksum_address(self.SWAP_ROUTER_ADDRESS), abi=self.ERC20_CONTRACT_ABI)
-
-            instructions = self.build_instructions_data(address, swap_type, token_in, token_out)
-
-            token_address = self.ZERO_CONTRACT_ADDRESS if swap_type == "native to erc20" else token_in
-
-            swap_data = token_contract.functions.initiate(token_address, amount_to_wei, instructions)
-
-            max_priority_fee = web3.to_wei(0.001, "gwei")
-            max_fee = max_priority_fee
-
-            if swap_type == "native to erc20":
-                estimated_gas = swap_data.estimate_gas({"from": address, "value": amount_to_wei})
-                swap_tx = swap_data.build_transaction({
-                    "from": address,
-                    "value": amount_to_wei,
-                    "gas": int(estimated_gas * 1.2),
-                    "maxFeePerGas": int(max_fee),
-                    "maxPriorityFeePerGas": int(max_priority_fee),
-                    "nonce": web3.eth.get_transaction_count(address, "pending"),
-                    "chainId": web3.eth.chain_id,
-                })
-
-            elif swap_type == "erc20 to native":
-                estimated_gas = swap_data.estimate_gas({"from": address})
-                swap_tx = swap_data.build_transaction({
-                    "from": address,
-                    "gas": int(estimated_gas * 1.2),
-                    "maxFeePerGas": int(max_fee),
-                    "maxPriorityFeePerGas": int(max_priority_fee),
-                    "nonce": web3.eth.get_transaction_count(address, "pending"),
-                    "chainId": web3.eth.chain_id,
-                })
-
-            tx_hash = await self.send_raw_transaction_with_retries(account, web3, swap_tx)
-            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
-            block_number = receipt.blockNumber
-
-            return tx_hash, block_number
-        except Exception as e:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Message : {Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-            )
-            return None, None
+    
         
-    async def perform_bridge(self, account: str, address: str, rpc_url: str, dest_chain_id: int, src_address: str, amount: float, token_type: str, explorer: str, use_proxy: bool):
+    async def perform_bridge(self, account: str, address: str, rpc_url: str, dest_chain_id: int, src_address: str, amount: float, token_type: str, explorer: str, proxy_url: str):
         try:
-            web3 = await self.get_web3_with_check(address, rpc_url, use_proxy)
+            web3 = await self.get_web3_with_check(address, rpc_url, proxy_url)
 
             amount_to_wei = web3.to_wei(amount, "ether")
 
@@ -815,7 +726,7 @@ class KiteAI:
                 token_contract = web3.eth.contract(address=web3.to_checksum_address(src_address), abi=self.ERC20_CONTRACT_ABI)
 
                 if src_address == "0x0fF5393387ad2f9f691FD6Fd28e07E3969e27e63":
-                    await self.approving_token(account, address, rpc_url, self.BRIDGE_ROUTER_ADDRESS, src_address, amount_to_wei, explorer, use_proxy)
+                    await self.approving_token(account, address, rpc_url, self.BRIDGE_ROUTER_ADDRESS, src_address, amount_to_wei, explorer, proxy_url)
                     token_contract = web3.eth.contract(address=web3.to_checksum_address(self.BRIDGE_ROUTER_ADDRESS), abi=self.ERC20_CONTRACT_ABI)
 
             bridge_data = token_contract.functions.send(dest_chain_id, address, amount_to_wei)
@@ -862,14 +773,15 @@ class KiteAI:
         for remaining in range(random.randint(self.min_delay, self.max_delay), 0, -1):
             print(
                 f"{Fore.CYAN + Style.BRIGHT}[ {datetime.now().astimezone(wib).strftime('%x %X %Z')} ]{Style.RESET_ALL}"
-                f"{Fore.WHITE + Style.BRIGHT} | {Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT} | {Style.RESET_ALL}"
                 f"{Fore.BLUE + Style.BRIGHT}Wait For{Style.RESET_ALL}"
-                f"{Fore.WHITE + Style.BRIGHT} {remaining} {Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT} {remaining} {Style.RESET_ALL}"
                 f"{Fore.BLUE + Style.BRIGHT}Seconds For Next {message}...{Style.RESET_ALL}",
                 end="\r",
                 flush=True
             )
             await asyncio.sleep(1)
+
 
     def print_deposit_question(self):
         while True:
@@ -911,9 +823,9 @@ class KiteAI:
         while True:
             try:
                 print(f"{Fore.GREEN + Style.BRIGHT}Select Option:{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}1. Withdraw KITE Token{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}2. Withdraw USDT Token{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}3. Withdraw All Tokens{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW + Style.BRIGHT}1. Withdraw KITE Token{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW + Style.BRIGHT}2. Withdraw USDT Token{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW + Style.BRIGHT}3. Withdraw All Tokens{Style.RESET_ALL}")
                 option = int(input(f"{Fore.BLUE + Style.BRIGHT}Choose [1/2/3] -> {Style.RESET_ALL}").strip())
 
                 if option in [1, 2, 3]:
@@ -1089,136 +1001,6 @@ class KiteAI:
             except ValueError:
                 print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number.{Style.RESET_ALL}")
         
-    def print_question(self):
-        while True:
-            try:
-                print(f"{Fore.GREEN + Style.BRIGHT}Select Option:{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}1. Claim Faucets{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}2. Deposit KITE Token{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}3. Withdraw Tokens{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}4. Unstake KITE Token{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}5. Stake KITE Token{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}6. Claim Stake Reward{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}7. Complete Daily Quiz{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}8. AI Agent Chat{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}9. Create Multisig{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}10. Random Swap{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}11. Random Bridge{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}12. Run All Features{Style.RESET_ALL}")
-                option = int(input(f"{Fore.BLUE + Style.BRIGHT}Choose [1/2/3/4/5/6/7/8/9/10/11/12] -> {Style.RESET_ALL}").strip())
-
-                if option in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]:
-                    option_type = (
-                        "Claim Faucets" if option == 1 else 
-                        "Deposit KITE Token" if option == 2 else 
-                        "Withdraw Tokens" if option == 3 else 
-                        "Unstake KITE Token" if option == 4 else 
-                        "Stake KITE Token" if option == 5 else 
-                        "Claim Stake Reward" if option == 6 else 
-                        "Complete Daily Quiz" if option == 7 else 
-                        "AI Agent Chat" if option == 8 else 
-                        "Create Multisig" if option == 9 else 
-                        "Random Swap" if option == 10 else 
-                        "Random Bridge" if option == 11 else 
-                        "Run All Features"
-                    )
-                    print(f"{Fore.GREEN + Style.BRIGHT}{option_type} Selected.{Style.RESET_ALL}")
-                    break
-                else:
-                    print(f"{Fore.RED + Style.BRIGHT}Please enter either 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, or 12.{Style.RESET_ALL}")
-            except ValueError:
-                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, or 12).{Style.RESET_ALL}")
-
-        if option == 2:
-            self.print_deposit_question()
-
-        elif option == 3:
-            self.print_withdraw_options()
-
-        elif option == 4:
-            self.print_unstake_question()
-            self.print_delay_question()
-
-        elif option == 5:
-            self.print_stake_question()
-            self.print_delay_question()
-
-        elif option == 6:
-            self.print_delay_question()
-
-        elif option == 8:
-            self.print_ai_chat_question()
-            self.print_delay_question()
-
-        elif option == 9:
-            self.print_multisig_question()
-            self.print_delay_question()
-
-        elif option == 10:
-            self.print_swap_question()
-            self.print_delay_question()
-
-        elif option == 11:
-            self.print_bridge_question()
-            self.print_delay_question()
-
-        elif option == 12:
-            if self.auto_deposit_token:
-                self.print_deposit_question()
-
-            if self.auto_withdraw_token:
-                self.print_withdraw_options()
-
-            if self.auto_unstake_token:
-                self.print_unstake_question()
-
-            if self.auto_stake_token:
-                self.print_stake_question()
-
-            if self.auto_chat_ai_agent:
-                self.print_ai_chat_question()
-
-            if self.auto_create_multisig:
-                self.print_multisig_question()
-
-            if self.auto_swap_token:
-                self.print_swap_question()
-
-            if self.auto_bridge_token:
-                self.print_bridge_question()
-            
-            self.print_delay_question()
-
-        while True:
-            try:
-                print(f"{Fore.WHITE + Style.BRIGHT}1. Run With Proxy{Style.RESET_ALL}")
-                print(f"{Fore.WHITE + Style.BRIGHT}2. Run Without Proxy{Style.RESET_ALL}")
-                proxy_choice = int(input(f"{Fore.BLUE + Style.BRIGHT}Choose [1/2] -> {Style.RESET_ALL}").strip())
-
-                if proxy_choice in [1, 2]:
-                    proxy_type = (
-                        "With" if proxy_choice == 1 else 
-                        "Without"
-                    )
-                    print(f"{Fore.GREEN + Style.BRIGHT}Run {proxy_type} Proxy Selected.{Style.RESET_ALL}")
-                    break
-                else:
-                    print(f"{Fore.RED + Style.BRIGHT}Please enter either 1 or 2.{Style.RESET_ALL}")
-            except ValueError:
-                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number (1 or 2).{Style.RESET_ALL}")
-
-        rotate_proxy = False
-        if proxy_choice == 1:
-            while True:
-                rotate_proxy = input(f"{Fore.BLUE + Style.BRIGHT}Rotate Invalid Proxy? [y/n] -> {Style.RESET_ALL}").strip()
-
-                if rotate_proxy in ["y", "n"]:
-                    rotate_proxy = rotate_proxy == "y"
-                    break
-                else:
-                    print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter 'y' or 'n'.{Style.RESET_ALL}")
-
-        return option, proxy_choice, rotate_proxy
     
     async def solve_recaptcha(self, site_key: str, page_url: str, retries=5):
         for attempt in range(retries):
@@ -1250,7 +1032,7 @@ class KiteAI:
                         request_id = result.get("request")
                         self.log(
                             f"{Fore.BLUE + Style.BRIGHT}   Req Id  : {Style.RESET_ALL}"
-                            f"{Fore.WHITE + Style.BRIGHT}{request_id}{Style.RESET_ALL}"
+                            f"{Fore.YELLOW + Style.BRIGHT}{request_id}{Style.RESET_ALL}"
                         )
 
                         for _ in range(30):
@@ -1301,7 +1083,7 @@ class KiteAI:
         
         return None
     
-    async def user_signin(self, address: str, use_proxy: bool, retries=5):
+    async def user_signin(self, address: str, proxy_url: str, retries=5):
         url = f"{self.NEO_API}/v2/signin"
         data = json.dumps({"eoa":address})
         headers = {
@@ -1312,7 +1094,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1341,7 +1122,7 @@ class KiteAI:
         
         return None
     
-    async def user_data(self, address: str, use_proxy: bool, retries=5):
+    async def user_data(self, address: str, proxy_url: str, retries=5):
         url = f"{self.OZONE_API}/me"
         headers = {
             **self.TESTNET_HEADERS[address],
@@ -1349,7 +1130,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1369,7 +1149,7 @@ class KiteAI:
 
         return None
     
-    async def claim_testnet_faucet(self, address: str, recaptcha_token: str, use_proxy: bool, retries=5):
+    async def claim_testnet_faucet(self, address: str, recaptcha_token: str, proxy_url: str, retries=5):
         url = f"{self.OZONE_API}/blockchain/faucet-transfer"
         headers = {
             **self.TESTNET_HEADERS[address],
@@ -1380,7 +1160,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1400,7 +1179,7 @@ class KiteAI:
 
         return None
     
-    async def claim_bridge_faucet(self, address: str, payload: dict, use_proxy: bool, retries=5):
+    async def claim_bridge_faucet(self, address: str, payload: dict, proxy_url: str, retries=5):
         url = f"{self.FAUCET_API}/api/sendToken"
         data = json.dumps(payload)
         headers = {
@@ -1410,7 +1189,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1441,33 +1219,7 @@ class KiteAI:
 
         return None
             
-    async def token_balance(self, address: str, use_proxy: bool, retries=5):
-        url = f"{self.OZONE_API}/me/balance"
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}"
-        }
-        await asyncio.sleep(3)
-        for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
-            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
-            try:
-                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
-                        response.raise_for_status()
-                        return await response.json()
-            except (Exception, ClientResponseError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Fetch Token Balance Failed{Style.RESET_ALL}"
-                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-                )
-
-        return None
+    
     
     async def withdraw_token(self, address: str, amount: int, token_type: str, use_proxy: bool, retries=5):
         url = f"{self.NEO_API}/v2/transfer?eoa={address}&amount={amount}&type={token_type}"
@@ -1500,90 +1252,17 @@ class KiteAI:
 
         return None
     
-    async def staked_info(self, address: str, subnet_id: str, use_proxy: bool, retries=5):
-        url = f"{self.OZONE_API}/subnet/{subnet_id}/staked-info?id={subnet_id}"
+    
+    async def submit_bridge_transfer(self, address: str, src_chain_id: int, dest_chain_id: int, src_address: str, dest_address: str, amount_to_wei: int, tx_hash: str, proxy_url: str, retries=5):
+        url = f"{self.BRIDGE_API}/bridge-transfer"
+        data = json.dumps(self.generate_bridge_payload(address, src_chain_id, dest_chain_id, src_address, dest_address, amount_to_wei, tx_hash))
         headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}"
-        }
-        await asyncio.sleep(3)
-        for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
-            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
-            try:
-                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
-                        response.raise_for_status()
-                        return await response.json()
-            except (Exception, ClientResponseError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Fetch Staked Balance Failed{Style.RESET_ALL}"
-                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-                )
-
-        return None
-            
-    async def unstake_token(self, address: str, subnet_address: str, unstake_amount: int, use_proxy: bool, retries=5):
-        url = f"{self.OZONE_API}/subnet/undelegate"
-        data = json.dumps({"subnet_address":subnet_address, "amount":unstake_amount})
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}",
+            **self.BRIDGE_HEADERS[address],
             "Content-Length": str(len(data)),
             "Content-Type": "application/json"
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
-            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
-            try:
-                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
-                        if response.status == 500:
-                            result = await response.json()
-                            err_msg = result.get("error", "Unknown Error")
-
-                            if "Staking period too short" in err_msg:
-                                self.log(
-                                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                                    f"{Fore.RED+Style.BRIGHT}Unstake Failed{Style.RESET_ALL}"
-                                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                                    f"{Fore.YELLOW+Style.BRIGHT}{err_msg}{Style.RESET_ALL}"
-                                )
-                                return None
-
-                        response.raise_for_status()
-                        return await response.json()
-            except (Exception, ClientResponseError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Unstake Failed{Style.RESET_ALL}"
-                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-                )
-
-        return None
-            
-    async def stake_token(self, address: str, subnet_address: str, stake_amount: int, use_proxy: bool, retries=5):
-        url = f"{self.OZONE_API}/subnet/delegate"
-        data = json.dumps({"subnet_address":subnet_address, "amount":stake_amount})
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}",
-            "Content-Length": str(len(data)),
-            "Content-Type": "application/json"
-        }
-        await asyncio.sleep(3)
-        for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1595,123 +1274,483 @@ class KiteAI:
                     await asyncio.sleep(5)
                     continue
                 self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Stake Failed{Style.RESET_ALL}"
-                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-                )
-
-        return None
-
-    async def claim_stake_rewards(self, address: str, subnet_address: str, use_proxy: bool, retries=5):
-        url = f"{self.OZONE_API}/subnet/claim-rewards"
-        data = json.dumps({"subnet_address":subnet_address})
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}",
-            "Content-Length": str(len(data)),
-            "Content-Type": "application/json"
-        }
-        await asyncio.sleep(3)
-        for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
-            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
-            try:
-                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
-                        response.raise_for_status()
-                        return await response.json()
-            except (Exception, ClientResponseError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Claim Failed{Style.RESET_ALL}"
+                    f"{Fore.BLUE+Style.BRIGHT}   Submit  : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Failed{Style.RESET_ALL}"
                     f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
                     f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
                 )
 
         return None
     
-    async def create_quiz(self, address: str, use_proxy: bool, retries=5):
-        url = f"{self.NEO_API}/v2/quiz/create"
-        data = json.dumps({"title":self.generate_quiz_title(), "num":1, "eoa":address})
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}",
-            "Cookie": self.header_cookies[address],
-            "Content-Length": str(len(data)),
-            "Content-Type": "application/json"
-        }
-        await asyncio.sleep(3)
-        for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
-            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
-            try:
-                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
-                        response.raise_for_status()
-                        return await response.json()
-            except (Exception, ClientResponseError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(5)
-                    continue
+    async def process_perform_deposit(self, account: str, address: str, receiver: str, use_proxy: bool):
+        tx_hash, block_number = await self.perform_deposit(account, address, receiver, use_proxy)
+        if tx_hash and block_number:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+            )
+
+        else:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
+            )
+
+    async def process_perform_withdraw(self, address: str, withdraw_amount: int, token_type: str, use_proxy: bool):
+        withdraw = await self.withdraw_token(address, withdraw_amount, token_type, use_proxy)
+        if withdraw:
+            tx_hash = withdraw.get("data", {}).get("receipt", {}).get("transactionHash")
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+            )
+
+    
+
+    
+    async def process_perform_bridge(self, account: str, address: str, rpc_url: str, src_chain_id: int, dest_chain_id: int, src_address: str, dest_address: str, amount: float, token_type: str, explorer: str, proxy_url: str):
+        tx_hash, block_number, amount_to_wei = await self.perform_bridge(account, address, rpc_url, dest_chain_id, src_address, amount, token_type, explorer, proxy_url)
+        if tx_hash and block_number and amount_to_wei:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{explorer}{tx_hash}{Style.RESET_ALL}"
+            )
+
+            submit = await self.submit_bridge_transfer(address, src_chain_id, dest_chain_id, src_address, dest_address, amount_to_wei, tx_hash, proxy_url)
+            if submit:
                 self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Fetch Today Quiz Failed{Style.RESET_ALL}"
-                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                    f"{Fore.BLUE+Style.BRIGHT}   Submit  : {Style.RESET_ALL}"
+                    f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}"
                 )
 
-        return None
-        
-    async def get_quiz(self, address: str, quiz_id: int, use_proxy: bool, retries=5):
-        url = f"{self.NEO_API}/v2/quiz/get?id={quiz_id}&eoa={address}"
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}",
-            "Cookie": self.header_cookies[address]
-        }
-        await asyncio.sleep(3)
-        for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
-            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
-            try:
-                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
-                        response.raise_for_status()
-                        return await response.json()
-            except (Exception, ClientResponseError) as e:
-                if attempt < retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Fetch Question & Answer Failed{Style.RESET_ALL}"
-                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
-                )
+        else:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
+            )
 
-        return None
+
+    # 右上角的 deposit 存款逻辑
+    async def process_smart_deposit(self, account: str, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Deposit   :{Style.RESET_ALL}                                              ")
+
+        self.log(
+            f"{Fore.BLUE+Style.BRIGHT}   Receiver: {Style.RESET_ALL}"
+            f"{Fore.YELLOW+Style.BRIGHT}{self.aa_address[address]}{Style.RESET_ALL}"
+        )
+        self.log(
+            f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+            f"{Fore.YELLOW+Style.BRIGHT}{self.deposit_amount} KITE{Style.RESET_ALL}"
+        )
+
+        balance = await self.get_token_balance(address, self.KITE_AI['rpc_url'], "", "native", proxy_url)
+        self.log(
+            f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+            f"{Fore.YELLOW+Style.BRIGHT}{balance} KITE{Style.RESET_ALL}"
+        )
+
+        if not balance or balance <= self.deposit_amount:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Balance{Style.RESET_ALL}"
+            )
+            return
+
+        await self.process_perform_deposit(account, address, self.aa_address[address], proxy_url)
+
+    async def process_smart_withdraw(self, address: str, use_proxy: bool):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Withdraw  :{Style.RESET_ALL}                                              ")
+
+        balance = await self.token_balance(address, use_proxy)
+        if not balance: return
+
+        kite_balance = balance.get("data", {}).get("balances", {}).get("kite", 0)
+        usdt_balance = balance.get("data", {}).get("balances", {}).get("usdt", 0)
+
+        if self.withdraw_option == 1:
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN + Style.BRIGHT}KITE{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.withdraw_kite_amount} KITE{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{kite_balance} KITE{Style.RESET_ALL}"
+            )
+
+            if kite_balance < self.withdraw_kite_amount:
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Balance{Style.RESET_ALL}"
+                )
+                return
             
-    async def submit_quiz(self, address: str, quiz_id: int, question_id: int, quiz_answer: str, use_proxy: bool, retries=5):
-        url = f"{self.NEO_API}/v2/quiz/submit"
-        data = json.dumps({"quiz_id":quiz_id, "question_id":question_id, "answer":quiz_answer, "finish":True, "eoa":address})
-        headers = {
-            **self.TESTNET_HEADERS[address],
-            "Authorization": f"Bearer {self.access_tokens[address]}",
-            "Cookie": self.header_cookies[address],
-            "Content-Length": str(len(data)),
-            "Content-Type": "application/json"
-        }
+            await self.process_perform_withdraw(address, self.withdraw_kite_amount, "native", use_proxy)
+
+        elif self.withdraw_option == 2:
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN + Style.BRIGHT}USDT{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.withdraw_usdt_amount} USDT{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{usdt_balance} USDT{Style.RESET_ALL}"
+            )
+
+            if usdt_balance < self.withdraw_usdt_amount:
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient USDT Token Balance{Style.RESET_ALL}"
+                )
+                return
+            
+            await self.process_perform_withdraw(address, self.withdraw_usdt_amount, "erc20", use_proxy)
+
+        elif self.withdraw_option == 3:
+            for token in ["KITE", "USDT"]:
+
+                if token == "KITE":
+                    withdraw_amount = self.withdraw_kite_amount
+                    token_balance = kite_balance
+                    token_type = "native"
+
+                elif token == "USDT":
+                    withdraw_amount = self.withdraw_usdt_amount
+                    token_balance = usdt_balance
+                    token_type = "erc20"
+
+
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
+                    f"{Fore.GREEN + Style.BRIGHT}{token}{Style.RESET_ALL}                                              "
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{withdraw_amount} {token}{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{token_balance} {token}{Style.RESET_ALL}"
+                )
+
+                if token_balance < withdraw_amount:
+                    self.log(
+                        f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                        f"{Fore.YELLOW+Style.BRIGHT}Insufficient {token} Token Balance{Style.RESET_ALL}"
+                    )
+                    continue
+                
+                await self.process_perform_withdraw(address, withdraw_amount, token_type, use_proxy)
+                await self.print_timer("Transactions")
+
+    # 处理随机 bridge
+    async def process_random_bridge(self, account: str, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Bridge    :{Style.RESET_ALL}                                              ")
+
+        for i in range(self.bridge_count):
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Bridge{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {self.bridge_count} {Style.RESET_ALL}                                              "
+            )
+
+            bridge_data = self.generate_bridge_option()
+            option = bridge_data["option"]
+            rpc_url = bridge_data["rpc_url"]
+            explorer = bridge_data["explorer"]
+            amount = bridge_data["amount"]
+            src_chain_id = bridge_data["src_chain_id"]
+            dest_chain_id = bridge_data["dest_chain_id"]
+            token_type = bridge_data["src_token"]["type"]
+            src_ticker = bridge_data["src_token"]["ticker"]
+            src_address = bridge_data["src_token"]["address"]
+            dest_address = bridge_data["dest_token"]["address"]
+
+            balance = await self.get_token_balance(address, rpc_url, src_address, token_type, proxy_url)
+
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Option  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{option}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{balance} {src_ticker}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{amount} {src_ticker}{Style.RESET_ALL}"
+            )
+
+            if not balance or balance <= amount:
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient {src_ticker} Token Balance{Style.RESET_ALL}"
+                )
+                continue
+
+            await self.process_perform_bridge(account, address, rpc_url, src_chain_id, dest_chain_id, src_address, dest_address, amount, token_type, explorer, proxy_url)
+            await self.print_timer("Transactions")
+
+
+
+    # 执行 swap
+    async def perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float, proxy_url: str):
+        try:
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], proxy_url)
+
+            amount_to_wei = web3.to_wei(amount, "ether")
+
+            if swap_type == "native to erc20":
+                token_contract = web3.eth.contract(address=web3.to_checksum_address(self.SWAP_ROUTER_ADDRESS), abi=self.NATIVE_CONTRACT_ABI)
+
+            elif swap_type == "erc20 to native":
+                await self.approving_token(
+                    account, address, self.KITE_AI["rpc_url"], self.SWAP_ROUTER_ADDRESS, token_in, amount_to_wei, self.KITE_AI["explorer"], proxy_url
+                )
+                token_contract = web3.eth.contract(address=web3.to_checksum_address(self.SWAP_ROUTER_ADDRESS), abi=self.ERC20_CONTRACT_ABI)
+
+            instructions = self.build_instructions_data(address, swap_type, token_in, token_out)
+
+            token_address = self.ZERO_CONTRACT_ADDRESS if swap_type == "native to erc20" else token_in
+
+            swap_data = token_contract.functions.initiate(token_address, amount_to_wei, instructions)
+
+            max_priority_fee = web3.to_wei(0.001, "gwei")
+            max_fee = max_priority_fee
+
+            if swap_type == "native to erc20":
+                estimated_gas = swap_data.estimate_gas({"from": address, "value": amount_to_wei})
+                swap_tx = swap_data.build_transaction({
+                    "from": address,
+                    "value": amount_to_wei,
+                    "gas": int(estimated_gas * 1.2),
+                    "maxFeePerGas": int(max_fee),
+                    "maxPriorityFeePerGas": int(max_priority_fee),
+                    "nonce": web3.eth.get_transaction_count(address, "pending"),
+                    "chainId": web3.eth.chain_id,
+                })
+
+            elif swap_type == "erc20 to native":
+                estimated_gas = swap_data.estimate_gas({"from": address})
+                swap_tx = swap_data.build_transaction({
+                    "from": address,
+                    "gas": int(estimated_gas * 1.2),
+                    "maxFeePerGas": int(max_fee),
+                    "maxPriorityFeePerGas": int(max_priority_fee),
+                    "nonce": web3.eth.get_transaction_count(address, "pending"),
+                    "chainId": web3.eth.chain_id,
+                })
+
+            tx_hash = await self.send_raw_transaction_with_retries(account, web3, swap_tx)
+            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+            block_number = receipt.blockNumber
+
+            return tx_hash, block_number
+        except Exception as e:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+            )
+            return None, None
+
+    # 随机 swap
+    async def process_perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float, proxy_url: str):
+        tx_hash, block_number = await self.perform_swap(account, address, swap_type, token_in, token_out, amount, proxy_url)
+        if tx_hash and block_number:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+            )
+        else:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
+            )
+    
+
+    # 处理随机 swap
+    async def process_random_swap(self, account: str, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Swap      :{Style.RESET_ALL}                                              ")
+
+        for i in range(self.swap_count):
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Swap{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {self.swap_count} {Style.RESET_ALL}                                              "
+            )
+
+            swap_type, option, token_in, token_out, ticker, token_type, amount = self.generate_swap_option()
+
+            balance = await self.get_token_balance(address, self.KITE_AI['rpc_url'], token_in, token_type, proxy_url)
+
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Options : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{option}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{balance} {ticker}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{amount} {ticker}{Style.RESET_ALL}"
+            )
+
+            if not balance or balance <= amount:
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient {ticker} Token Balance{Style.RESET_ALL}"
+                )
+                continue
+
+            await self.process_perform_swap(account, address, swap_type, token_in, token_out, amount, proxy_url)
+            await self.print_timer("Transactions")
+
+    async def get_web3_with_check(self, address: str, rpc_url: str, proxy_url: str, retries=3, timeout=60):
+        request_kwargs = {"timeout": timeout}
+
+        # request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+
+        for attempt in range(retries):
+            try:
+                web3 = Web3(provider=Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
+                web3.eth.get_block_number()
+                return web3
+            except Exception as e:
+                if attempt < retries:
+                    await asyncio.sleep(3)
+                    continue
+                raise Exception(f"Failed to Connect to RPC: {str(e)}")
+
+    async def perform_create_proxy(self, account: str, address: str, salt_nonce: int, proxy_address: str):
+        try:
+            web3 = await self.get_web3_with_check(address, self.KITE_AI['rpc_url'], proxy_address)
+
+            initializer = self.build_initializer_data(address)
+
+            token_contract = web3.eth.contract(address=web3.to_checksum_address(self.SAFE_PROXY_FACTORY_ADDRESS), abi=self.ERC20_CONTRACT_ABI)
+            create_proxy_data = token_contract.functions.createProxyWithNonce(self.GNOSIS_SAFE_L2_ADDRESS, initializer, salt_nonce)
+            
+            proxy_address = create_proxy_data.call({"from": address})
+
+            estimated_gas = create_proxy_data.estimate_gas({"from": address})
+            max_priority_fee = web3.to_wei(0.001, "gwei")
+            max_fee = max_priority_fee
+
+            create_proxy_tx = create_proxy_data.build_transaction({
+                "from": address,
+                "gas": int(estimated_gas * 1.2),
+                "maxFeePerGas": int(max_fee),
+                "maxPriorityFeePerGas": int(max_priority_fee),
+                "nonce": web3.eth.get_transaction_count(address, "pending"),
+                "chainId": web3.eth.chain_id,
+            })
+
+            tx_hash = await self.send_raw_transaction_with_retries(account, web3, create_proxy_tx)
+            receipt = await self.wait_for_receipt_with_retries(web3, tx_hash)
+            block_number = receipt.blockNumber
+
+            return tx_hash, block_number, proxy_address
+        except Exception as e:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+            )
+            return None, None, None
+
+    async def process_perform_create_proxy(self, account: str, address: str, salt_nonce: int, proxy_address: str):
+        tx_hash, block_number, proxy_address = await self.perform_create_proxy(account, address, salt_nonce, proxy_address)
+        if tx_hash and block_number and proxy_address:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Address : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{proxy_address}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+            )
+        else:
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
+            )
+
+
+    async def owner_safes_wallet(self, address: str, proxy_url: str, retries=5):
+        url = f"{self.MULTISIG_API}/chains/2368/owners/{address}/safes"
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
-                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
+                    async with session.get(url=url, headers=self.MULTISIG_HEADERS[address], proxy=proxy, proxy_auth=proxy_auth) as response:
                         response.raise_for_status()
                         return await response.json()
             except (Exception, ClientResponseError) as e:
@@ -1719,15 +1758,38 @@ class KiteAI:
                     await asyncio.sleep(5)
                     continue
                 self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Submit Answer Failed{Style.RESET_ALL}"
+                    f"{Fore.BLUE+Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Fetch Salt Nonce Failed{Style.RESET_ALL}"
                     f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
                     f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
                 )
 
         return None
-            
-    async def agent_inference(self, address: str, service_id: str, question: str, use_proxy: bool, retries=5):
+
+    # Create Multisig
+    async def process_multisig_task(self, account: str, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Multisig  :{Style.RESET_ALL}                                              ")
+
+        for i in range(self.multisig_count):
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Create{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {self.multisig_count} {Style.RESET_ALL}                                              "
+            )
+
+            safes = await self.owner_safes_wallet(address, proxy_url)
+            if not safes: continue
+
+            salt_nonce = len(safes.get("safes", []))
+
+            await self.process_perform_create_proxy(account, address, salt_nonce, proxy_url)
+            await self.print_timer("Transactions")
+
+
+    # ai agent 相关
+    async def agent_inference(self, address: str, service_id: str, question: str, proxy_url: str, retries=5):
         url = f"{self.OZONE_API}/agent/inference"
         data = json.dumps(self.generate_inference_payload(service_id, question))
         headers = {
@@ -1738,7 +1800,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1789,7 +1850,7 @@ class KiteAI:
 
         return None
             
-    async def submit_receipt(self, address: str, service_id: str, question: str, answer: str, use_proxy: bool, retries=5):
+    async def submit_receipt(self, address: str, service_id: str, question: str, answer: str, proxy_url: str, retries=5):
         url = f"{self.NEO_API}/v2/submit_receipt"
         data = json.dumps(self.generate_receipt_payload(self.aa_address[address], service_id, question, answer))
         headers = {
@@ -1801,7 +1862,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1821,7 +1881,7 @@ class KiteAI:
 
         return None
             
-    async def get_inference(self, address: str, inference_id: str, use_proxy: bool, retries=5):
+    async def get_inference(self, address: str, inference_id: str, proxy_url: str, retries=5):
         url = f"{self.NEO_API}/v1/inference?id={inference_id}"
         headers = {
             **self.TESTNET_HEADERS[address],
@@ -1830,7 +1890,6 @@ class KiteAI:
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1856,17 +1915,119 @@ class KiteAI:
 
         return None
     
-    async def submit_bridge_transfer(self, address: str, src_chain_id: int, dest_chain_id: int, src_address: str, dest_address: str, amount_to_wei: int, tx_hash: str, use_proxy: bool, retries=5):
-        url = f"{self.BRIDGE_API}/bridge-transfer"
-        data = json.dumps(self.generate_bridge_payload(address, src_chain_id, dest_chain_id, src_address, dest_address, amount_to_wei, tx_hash))
+    # 处理ai聊天
+    async def process_ai_agents_chat(self, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}AI Agent  :{Style.RESET_ALL}                                              ")
+
+        used_questions_per_agent = {}
+
+        for i in range(self.ai_chat_count):
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}Chat{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
+                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {self.ai_chat_count} {Style.RESET_ALL}                                              "
+            )
+
+            agent = random.choice(self.agent_lists)
+            agent_name = agent["agentName"]
+            service_id = agent["serviceId"]
+            questions = agent["questionLists"]
+
+            if agent_name not in used_questions_per_agent:
+                used_questions_per_agent[agent_name] = set()
+
+            used_questions = used_questions_per_agent[agent_name]
+            available_questions = [q for q in questions if q not in used_questions]
+
+            question = random.choice(available_questions)
+
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT}   Agent   : {Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT}{agent_name}{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT}   Question: {Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT}{question}{Style.RESET_ALL}"
+            )
+
+            answer = await self.agent_inference(address, service_id, question, proxy_url)
+            if not answer:
+                continue
+
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT}   Answer  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT}{answer}{Style.RESET_ALL}"
+            )
+
+            submit = await self.submit_receipt(address, service_id, question, answer, proxy_url)
+            if submit:
+                inference_id = submit.get("data", {}).get("id")
+
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.GREEN + Style.BRIGHT}Receipt Submited Successfully{Style.RESET_ALL}"
+                )
+
+                tx_hash = await self.get_inference(address, inference_id, proxy_url)
+                if tx_hash:
+                    self.log(
+                        f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                        f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+                    )
+                    self.log(
+                        f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                        f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+                    )
+
+            used_questions.add(question)
+
+            await self.print_timer("Interactions")
+
+
+    # 获取每日问卷
+    async def get_quiz(self, address: str, quiz_id: int, proxy_url: str, retries=5):
+        url = f"{self.NEO_API}/v2/quiz/get?id={quiz_id}&eoa={address}"
         headers = {
-            **self.BRIDGE_HEADERS[address],
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}",
+            "Cookie": self.header_cookies[address]
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Fetch Question & Answer Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                )
+
+        return None
+            
+    # 提交每日问卷
+    async def submit_quiz(self, address: str, quiz_id: int, question_id: int, quiz_answer: str, proxy_url: str, retries=5):
+        url = f"{self.NEO_API}/v2/quiz/submit"
+        data = json.dumps({"quiz_id":quiz_id, "question_id":question_id, "answer":quiz_answer, "finish":True, "eoa":address})
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}",
+            "Cookie": self.header_cookies[address],
             "Content-Length": str(len(data)),
             "Content-Type": "application/json"
         }
         await asyncio.sleep(3)
         for attempt in range(retries):
-            proxy_url = self.get_next_proxy_for_account(address) if use_proxy else None
             connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
             try:
                 async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
@@ -1878,145 +2039,421 @@ class KiteAI:
                     await asyncio.sleep(5)
                     continue
                 self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Submit  : {Style.RESET_ALL}"
-                    f"{Fore.RED+Style.BRIGHT}Failed{Style.RESET_ALL}"
+                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Submit Answer Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                )
+
+        return None
+   
+    # 生成每日问卷
+    async def create_quiz(self, address: str, proxy_url: str, retries=5):
+        url = f"{self.NEO_API}/v2/quiz/create"
+        data = json.dumps({"title":self.generate_quiz_title(), "num":1, "eoa":address})
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}",
+            "Cookie": self.header_cookies[address],
+            "Content-Length": str(len(data)),
+            "Content-Type": "application/json"
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Fetch Today Quiz Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                )
+
+        return None
+
+    # 处理回答每日问题
+    async def process_daily_quiz(self, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Daily Quiz:{Style.RESET_ALL}                                              ")
+
+        create = await self.create_quiz(address, proxy_url)
+        if not create: return
+
+        quiz_id = create.get("data", {}).get("quiz_id")
+        status = create.get("data", {}).get("status")
+
+        self.log(
+            f"{Fore.BLUE + Style.BRIGHT}   Quiz Id : {Style.RESET_ALL}"
+            f"{Fore.YELLOW + Style.BRIGHT}{quiz_id}{Style.RESET_ALL}"
+        )
+
+        if status != 0:
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW + Style.BRIGHT}Already Answered Today{Style.RESET_ALL}"
+            )
+            return
+        
+        quiz = await self.get_quiz(address, quiz_id, proxy_url)
+        if not quiz: return
+
+        questions = quiz.get("data", {}).get("question", [])
+
+        for question in questions:
+            if question:
+                question_id = question.get("question_id")
+                quiz_content = question.get("content")
+                quiz_answer = question.get("answer")
+
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Question: {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{quiz_content}{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Answer  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{quiz_answer}{Style.RESET_ALL}"
+                )
+
+                submit_quiz = await self.submit_quiz(address, quiz_id, question_id, quiz_answer, proxy_url)
+                if not submit_quiz: return
+
+                result = submit_quiz.get("data", {}).get("result")
+
+                if result == "RIGHT":
+                    self.log(
+                        f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                        f"{Fore.GREEN+Style.BRIGHT}Correct{Style.RESET_ALL}"
+                    )
+                else:
+                    self.log(
+                        f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                        f"{Fore.YELLOW+Style.BRIGHT}Wrong{Style.RESET_ALL}"
+                    )
+
+
+    # 领取质押奖励
+    async def claim_stake_rewards(self, address: str, subnet_address: str, proxy_url: str, retries=5):
+        url = f"{self.OZONE_API}/subnet/claim-rewards"
+        data = json.dumps({"subnet_address":subnet_address})
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}",
+            "Content-Length": str(len(data)),
+            "Content-Type": "application/json"
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Claim Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                )
+
+        return None
+
+
+    # 处理领取质押奖励
+    async def process_claim_stake_reward(self, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Reward    :{Style.RESET_ALL}                                              ")
+
+        for subnet in [self.BITMIND_SUBNET, self.VERONIKA_SUBNET, self.KITE_SUBNET, self.BITTE_SUBNET]:
+            subnet_id = subnet["id"]
+            subnet_name = subnet["name"]
+            subnet_address = subnet["address"]
+
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}{subnet_name}{Style.RESET_ALL}                                              "
+            )
+
+            claim = await self.claim_stake_rewards(address, subnet_address, proxy_url)
+            if claim:
+                amount = claim.get("data", {}).get("claim_amount")
+                tx_hash = claim.get("data", {}).get("tx_hash")
+
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.GREEN+Style.BRIGHT}Claimed Successfully{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{amount} USDT{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+                )
+
+            await self.print_timer("Transactions")
+
+
+    # 获取token余额
+    async def token_balance(self, address: str, proxy_url: str, retries=5):
+        url = f"{self.OZONE_API}/me/balance"
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}"
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Fetch Token Balance Failed{Style.RESET_ALL}"
                     f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
                     f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
                 )
 
         return None
     
-    async def process_perform_deposit(self, account: str, address: str, receiver: str, use_proxy: bool):
-        tx_hash, block_number = await self.perform_deposit(account, address, receiver, use_proxy)
-        if tx_hash and block_number:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-            )
 
-        else:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
-            )
-
-    async def process_perform_withdraw(self, address: str, withdraw_amount: int, token_type: str, use_proxy: bool):
-        withdraw = await self.withdraw_token(address, withdraw_amount, token_type, use_proxy)
-        if withdraw:
-            tx_hash = withdraw.get("data", {}).get("receipt", {}).get("transactionHash")
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-            )
-
-    async def process_perform_create_proxy(self, account: str, address: str, use_proxy: bool):
-        tx_hash, block_number, proxy_address = await self.perform_create_proxy(account, address, use_proxy)
-        if tx_hash and block_number and proxy_address:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Address : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{proxy_address}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-            )
-        else:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
-            )
-
-    async def process_perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float, use_proxy: bool):
-        tx_hash, block_number = await self.perform_swap(account, address, swap_type, token_in, token_out, amount, use_proxy)
-        if tx_hash and block_number:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-            )
-        else:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
-            )
-    
-    async def process_perform_bridge(self, account: str, address: str, rpc_url: str, src_chain_id: int, dest_chain_id: int, src_address: str, dest_address: str, amount: float, token_type: str, explorer: str, use_proxy: bool):
-        tx_hash, block_number, amount_to_wei = await self.perform_bridge(account, address, rpc_url, dest_chain_id, src_address, amount, token_type, explorer, use_proxy)
-        if tx_hash and block_number and amount_to_wei:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Block   : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{block_number}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{explorer}{tx_hash}{Style.RESET_ALL}"
-            )
-
-            submit = await self.submit_bridge_transfer(address, src_chain_id, dest_chain_id, src_address, dest_address, amount_to_wei, tx_hash, use_proxy)
-            if submit:
+    # 质押 token
+    async def stake_token(self, address: str, subnet_address: str, stake_amount: int, proxy_url: str, retries=5):
+        url = f"{self.OZONE_API}/subnet/delegate"
+        data = json.dumps({"subnet_address":subnet_address, "amount":stake_amount})
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}",
+            "Content-Length": str(len(data)),
+            "Content-Type": "application/json"
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
                 self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Submit  : {Style.RESET_ALL}"
-                    f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}"
+                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Stake Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
                 )
 
-        else:
+        return None
+
+    # 处理质押
+    async def process_stake(self, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Staking   :{Style.RESET_ALL}                                              ")
+
+        balance = await self.token_balance(address, proxy_url)
+        if not balance: return
+
+        kite_balance = balance.get("data", {}).get("balances", {}).get("kite", 0)
+        
+        for subnet in [self.BITMIND_SUBNET, self.VERONIKA_SUBNET, self.KITE_SUBNET, self.BITTE_SUBNET]:
+            subnet_id = subnet["id"]
+            subnet_name = subnet["name"]
+            subnet_address = subnet["address"]
+
             self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.RED+Style.BRIGHT}Perform On-Chain Failed{Style.RESET_ALL}"
+                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}{subnet_name}{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.stake_amount} KITE{Style.RESET_ALL}"
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{kite_balance} KITE{Style.RESET_ALL}"
             )
 
-    async def process_option_1(self, address: str, user: dict, use_proxy: bool):
+            if kite_balance < self.stake_amount:
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Balance{Style.RESET_ALL}"
+                )
+                return
+            
+            stake = await self.stake_token(address, subnet_address, self.stake_amount, proxy_url)
+            if stake:
+                tx_hash = stake.get("data", {}).get("tx_hash")
+                
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+                )
+
+                kite_balance -= self.stake_amount
+
+            await self.print_timer("Transactions")
+    
+    
+    # 解除质押
+    async def unstake_token(self, address: str, subnet_address: str, unstake_amount: int, proxy_url: str, retries=5):
+        url = f"{self.OZONE_API}/subnet/undelegate"
+        data = json.dumps({"subnet_address":subnet_address, "amount":unstake_amount})
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}",
+            "Content-Length": str(len(data)),
+            "Content-Type": "application/json"
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.post(url=url, headers=headers, data=data, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        if response.status == 500:
+                            result = await response.json()
+                            err_msg = result.get("error", "Unknown Error")
+
+                            if "Staking period too short" in err_msg:
+                                self.log(
+                                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                                    f"{Fore.RED+Style.BRIGHT}Unstake Failed{Style.RESET_ALL}"
+                                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                                    f"{Fore.YELLOW+Style.BRIGHT}{err_msg}{Style.RESET_ALL}"
+                                )
+                                return None
+
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Unstake Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                )
+
+        return None
+
+    # 获取质押信息
+    async def staked_info(self, address: str, subnet_id: str, proxy_url: str, retries=5):
+        url = f"{self.OZONE_API}/subnet/{subnet_id}/staked-info?id={subnet_id}"
+        headers = {
+            **self.TESTNET_HEADERS[address],
+            "Authorization": f"Bearer {self.access_tokens[address]}"
+        }
+        await asyncio.sleep(3)
+        for attempt in range(retries):
+            connector, proxy, proxy_auth = self.build_proxy_config(proxy_url)
+            try:
+                async with ClientSession(connector=connector, timeout=ClientTimeout(total=60)) as session:
+                    async with session.get(url=url, headers=headers, proxy=proxy, proxy_auth=proxy_auth) as response:
+                        response.raise_for_status()
+                        return await response.json()
+            except (Exception, ClientResponseError) as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                self.log(
+                    f"{Fore.BLUE + Style.BRIGHT}   Message : {Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT}Fetch Staked Balance Failed{Style.RESET_ALL}"
+                    f"{Fore.MAGENTA+Style.BRIGHT} - {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{str(e)}{Style.RESET_ALL}"
+                )
+
+        return None
+
+    # 处理解除质押
+    async def process_unstake(self, address: str, proxy_url: str):
+        self.log(f"{Fore.CYAN+Style.BRIGHT}Unstaking :{Style.RESET_ALL}                                              ")
+
+        for subnet in [self.BITMIND_SUBNET, self.VERONIKA_SUBNET, self.KITE_SUBNET, self.BITTE_SUBNET]:
+            subnet_id = subnet["id"]
+            subnet_name = subnet["name"]
+            subnet_address = subnet["address"]
+
+            self.log(
+                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
+                f"{Fore.GREEN+Style.BRIGHT}{subnet_name}{Style.RESET_ALL}                                              "
+            )
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{self.unstake_amount} KITE{Style.RESET_ALL}"
+            )
+
+            staked = await self.staked_info(address, subnet_id, proxy_url)
+            if not staked: continue
+
+            staked_balance = staked.get("data", {}).get("my_staked_amount", 0)
+
+            self.log(
+                f"{Fore.BLUE+Style.BRIGHT}   Staked  : {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT}{staked_balance} KITE{Style.RESET_ALL}"
+            )
+
+            if staked_balance < self.unstake_amount:
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Staked Balance in {subnet_name} Subnet{Style.RESET_ALL}"
+                )
+                continue
+            
+            unstake = await self.unstake_token(address, subnet_address, self.unstake_amount, proxy_url)
+            if unstake:
+                staked_balance = unstake.get("data", {}).get("my_staked_amount")
+                tx_hash = unstake.get("data", {}).get("tx_hash")
+
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
+                    f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
+                    f"{Fore.YELLOW+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+                )
+
+            await self.print_timer("Transactions")
+    
+    # 领水逻辑
+    async def process_faucet(self, address: str, user: dict, proxy_url: str):
         self.log(f"{Fore.CYAN+Style.BRIGHT}Faucet    :{Style.RESET_ALL}")
         self.log(
             f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
@@ -2034,7 +2471,7 @@ class KiteAI:
                     f"{Fore.GREEN + Style.BRIGHT}Recaptcha Solved Successfully{Style.RESET_ALL}"
                 )
 
-                claim = await self.claim_testnet_faucet(address, recaptcha_token, use_proxy)
+                claim = await self.claim_testnet_faucet(address, recaptcha_token, proxy_url)
                 if claim:
                     self.log(
                         f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
@@ -2067,7 +2504,7 @@ class KiteAI:
                 else:
                     payload = {"address":address, "token":"", "v2Token":recaptcha_token, "chain":"KITE", "erc20":token_type, "couponId":""}
 
-                claim = await self.claim_bridge_faucet(address, payload, use_proxy)
+                claim = await self.claim_bridge_faucet(address, payload, proxy_url)
                 if claim:
                     tx_hash = claim.get("txHash")
 
@@ -2077,530 +2514,35 @@ class KiteAI:
                     )
                     self.log(
                         f"{Fore.BLUE + Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                        f"{Fore.WHITE + Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
+                        f"{Fore.YELLOW + Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
                     )
                     self.log(
                         f"{Fore.BLUE + Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                        f"{Fore.WHITE + Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
+                        f"{Fore.YELLOW + Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
                     )
-
-    async def process_option_2(self, account: str, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Deposit   :{Style.RESET_ALL}                                              ")
-
-        self.log(
-            f"{Fore.BLUE+Style.BRIGHT}   Receiver: {Style.RESET_ALL}"
-            f"{Fore.WHITE+Style.BRIGHT}{self.aa_address[address]}{Style.RESET_ALL}"
-        )
-        self.log(
-            f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-            f"{Fore.WHITE+Style.BRIGHT}{self.deposit_amount} KITE{Style.RESET_ALL}"
-        )
-
-        balance = await self.get_token_balance(address, self.KITE_AI['rpc_url'], "", "native", use_proxy)
-        self.log(
-            f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-            f"{Fore.WHITE+Style.BRIGHT}{balance} KITE{Style.RESET_ALL}"
-        )
-
-        if not balance or balance <= self.deposit_amount:
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Balance{Style.RESET_ALL}"
-            )
-            return
-
-        await self.process_perform_deposit(account, address, self.aa_address[address], use_proxy)
-
-    async def process_option_3(self, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Withdraw  :{Style.RESET_ALL}                                              ")
-
-        balance = await self.token_balance(address, use_proxy)
-        if not balance: return
-
-        kite_balance = balance.get("data", {}).get("balances", {}).get("kite", 0)
-        usdt_balance = balance.get("data", {}).get("balances", {}).get("usdt", 0)
-
-        if self.withdraw_option == 1:
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN + Style.BRIGHT}KITE{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.withdraw_kite_amount} KITE{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{kite_balance} KITE{Style.RESET_ALL}"
-            )
-
-            if kite_balance < self.withdraw_kite_amount:
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Balance{Style.RESET_ALL}"
-                )
-                return
-            
-            await self.process_perform_withdraw(address, self.withdraw_kite_amount, "native", use_proxy)
-
-        elif self.withdraw_option == 2:
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN + Style.BRIGHT}USDT{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.withdraw_usdt_amount} USDT{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{usdt_balance} USDT{Style.RESET_ALL}"
-            )
-
-            if usdt_balance < self.withdraw_usdt_amount:
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient USDT Token Balance{Style.RESET_ALL}"
-                )
-                return
-            
-            await self.process_perform_withdraw(address, self.withdraw_usdt_amount, "erc20", use_proxy)
-
-        elif self.withdraw_option == 3:
-            for token in ["KITE", "USDT"]:
-
-                if token == "KITE":
-                    withdraw_amount = self.withdraw_kite_amount
-                    token_balance = kite_balance
-                    token_type = "native"
-
-                elif token == "USDT":
-                    withdraw_amount = self.withdraw_usdt_amount
-                    token_balance = usdt_balance
-                    token_type = "erc20"
-
-
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
-                    f"{Fore.GREEN + Style.BRIGHT}{token}{Style.RESET_ALL}                                              "
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{withdraw_amount} {token}{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{token_balance} {token}{Style.RESET_ALL}"
-                )
-
-                if token_balance < withdraw_amount:
-                    self.log(
-                        f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                        f"{Fore.YELLOW+Style.BRIGHT}Insufficient {token} Token Balance{Style.RESET_ALL}"
-                    )
-                    continue
-                
-                await self.process_perform_withdraw(address, withdraw_amount, token_type, use_proxy)
-                await self.print_timer("Transactions")
-
-    async def process_option_4(self, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Unstaking :{Style.RESET_ALL}                                              ")
-
-        for subnet in [self.BITMIND_SUBNET, self.VERONIKA_SUBNET, self.KITE_SUBNET, self.BITTE_SUBNET]:
-            subnet_id = subnet["id"]
-            subnet_name = subnet["name"]
-            subnet_address = subnet["address"]
-
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}{subnet_name}{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.unstake_amount} KITE{Style.RESET_ALL}"
-            )
-
-            staked = await self.staked_info(address, subnet_id, use_proxy)
-            if not staked: continue
-
-            staked_balance = staked.get("data", {}).get("my_staked_amount", 0)
-
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Staked  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{staked_balance} KITE{Style.RESET_ALL}"
-            )
-
-            if staked_balance < self.unstake_amount:
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Staked Balance in {subnet_name} Subnet{Style.RESET_ALL}"
-                )
-                continue
-            
-            unstake = await self.unstake_token(address, subnet_address, self.unstake_amount, use_proxy)
-            if unstake:
-                staked_balance = unstake.get("data", {}).get("my_staked_amount")
-                tx_hash = unstake.get("data", {}).get("tx_hash")
-
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-                )
-
-            await self.print_timer("Transactions")
-
-    async def process_option_5(self, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Staking   :{Style.RESET_ALL}                                              ")
-
-        balance = await self.token_balance(address, use_proxy)
-        if not balance: return
-
-        kite_balance = balance.get("data", {}).get("balances", {}).get("kite", 0)
-        
-        for subnet in [self.BITMIND_SUBNET, self.VERONIKA_SUBNET, self.KITE_SUBNET, self.BITTE_SUBNET]:
-            subnet_id = subnet["id"]
-            subnet_name = subnet["name"]
-            subnet_address = subnet["address"]
-
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}{subnet_name}{Style.RESET_ALL}                                              "
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{self.stake_amount} KITE{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{kite_balance} KITE{Style.RESET_ALL}"
-            )
-
-            if kite_balance < self.stake_amount:
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient KITE Token Balance{Style.RESET_ALL}"
-                )
-                return
-            
-            stake = await self.stake_token(address, subnet_address, self.stake_amount, use_proxy)
-            if stake:
-                tx_hash = stake.get("data", {}).get("tx_hash")
-                
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.GREEN+Style.BRIGHT}Success{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-                )
-
-                kite_balance -= self.stake_amount
-
-            await self.print_timer("Transactions")
-
-    async def process_option_6(self, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Reward    :{Style.RESET_ALL}                                              ")
-
-        for subnet in [self.BITMIND_SUBNET, self.VERONIKA_SUBNET, self.KITE_SUBNET, self.BITTE_SUBNET]:
-            subnet_id = subnet["id"]
-            subnet_name = subnet["name"]
-            subnet_address = subnet["address"]
-
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}{subnet_name}{Style.RESET_ALL}                                              "
-            )
-
-            claim = await self.claim_stake_rewards(address, subnet_address, use_proxy)
-            if claim:
-                amount = claim.get("data", {}).get("claim_amount")
-                tx_hash = claim.get("data", {}).get("tx_hash")
-
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.GREEN+Style.BRIGHT}Claimed Successfully{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{amount} USDT{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-                )
-
-            await self.print_timer("Transactions")
-
-    async def process_option_7(self, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Daily Quiz:{Style.RESET_ALL}                                              ")
-
-        create = await self.create_quiz(address, use_proxy)
-        if not create: return
-
-        quiz_id = create.get("data", {}).get("quiz_id")
-        status = create.get("data", {}).get("status")
-
-        self.log(
-            f"{Fore.BLUE + Style.BRIGHT}   Quiz Id : {Style.RESET_ALL}"
-            f"{Fore.WHITE + Style.BRIGHT}{quiz_id}{Style.RESET_ALL}"
-        )
-
-        if status != 0:
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                f"{Fore.YELLOW + Style.BRIGHT}Already Answered Today{Style.RESET_ALL}"
-            )
-            return
-        
-        quiz = await self.get_quiz(address, quiz_id, use_proxy)
-        if not quiz: return
-
-        questions = quiz.get("data", {}).get("question", [])
-
-        for question in questions:
-            if question:
-                question_id = question.get("question_id")
-                quiz_content = question.get("content")
-                quiz_answer = question.get("answer")
-
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Question: {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{quiz_content}{Style.RESET_ALL}"
-                )
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Answer  : {Style.RESET_ALL}"
-                    f"{Fore.WHITE+Style.BRIGHT}{quiz_answer}{Style.RESET_ALL}"
-                )
-
-                submit_quiz = await self.submit_quiz(address, quiz_id, question_id, quiz_answer, use_proxy)
-                if not submit_quiz: return
-
-                result = submit_quiz.get("data", {}).get("result")
-
-                if result == "RIGHT":
-                    self.log(
-                        f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                        f"{Fore.GREEN+Style.BRIGHT}Correct{Style.RESET_ALL}"
-                    )
-                else:
-                    self.log(
-                        f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                        f"{Fore.YELLOW+Style.BRIGHT}Wrong{Style.RESET_ALL}"
-                    )
-
-    async def process_option_8(self, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}AI Agent  :{Style.RESET_ALL}                                              ")
-
-        used_questions_per_agent = {}
-
-        for i in range(self.ai_chat_count):
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Chat{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
-                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {self.ai_chat_count} {Style.RESET_ALL}                                              "
-            )
-
-            agent = random.choice(self.agent_lists)
-            agent_name = agent["agentName"]
-            service_id = agent["serviceId"]
-            questions = agent["questionLists"]
-
-            if agent_name not in used_questions_per_agent:
-                used_questions_per_agent[agent_name] = set()
-
-            used_questions = used_questions_per_agent[agent_name]
-            available_questions = [q for q in questions if q not in used_questions]
-
-            question = random.choice(available_questions)
-
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT}   Agent   : {Style.RESET_ALL}"
-                f"{Fore.WHITE + Style.BRIGHT}{agent_name}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT}   Question: {Style.RESET_ALL}"
-                f"{Fore.WHITE + Style.BRIGHT}{question}{Style.RESET_ALL}"
-            )
-
-            answer = await self.agent_inference(address, service_id, question, use_proxy)
-            if not answer:
-                continue
-
-            self.log(
-                f"{Fore.BLUE + Style.BRIGHT}   Answer  : {Style.RESET_ALL}"
-                f"{Fore.WHITE + Style.BRIGHT}{answer}{Style.RESET_ALL}"
-            )
-
-            submit = await self.submit_receipt(address, service_id, question, answer, use_proxy)
-            if submit:
-                inference_id = submit.get("data", {}).get("id")
-
-                self.log(
-                    f"{Fore.BLUE + Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.GREEN + Style.BRIGHT}Receipt Submited Successfully{Style.RESET_ALL}"
-                )
-
-                tx_hash = await self.get_inference(address, inference_id, use_proxy)
-                if tx_hash:
-                    self.log(
-                        f"{Fore.BLUE+Style.BRIGHT}   Tx Hash : {Style.RESET_ALL}"
-                        f"{Fore.WHITE+Style.BRIGHT}{tx_hash}{Style.RESET_ALL}"
-                    )
-                    self.log(
-                        f"{Fore.BLUE+Style.BRIGHT}   Explorer: {Style.RESET_ALL}"
-                        f"{Fore.WHITE+Style.BRIGHT}{self.KITE_AI['explorer']}{tx_hash}{Style.RESET_ALL}"
-                    )
-
-            used_questions.add(question)
-
-            await self.print_timer("Interactions")
-
-    async def process_option_9(self, account: str, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Multisig  :{Style.RESET_ALL}                                              ")
-
-        for i in range(self.multisig_count):
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Create{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
-                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {self.multisig_count} {Style.RESET_ALL}                                              "
-            )
-
-            await self.process_perform_create_proxy(account, address, use_proxy)
-            await self.print_timer("Transactions")
-
-    async def process_option_10(self, account: str, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Swap      :{Style.RESET_ALL}                                              ")
-
-        for i in range(self.swap_count):
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Swap{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
-                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {self.swap_count} {Style.RESET_ALL}                                              "
-            )
-
-            swap_type, option, token_in, token_out, ticker, token_type, amount = self.generate_swap_option()
-
-            balance = await self.get_token_balance(address, self.KITE_AI['rpc_url'], token_in, token_type, use_proxy)
-
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Options : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{option}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{balance} {ticker}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{amount} {ticker}{Style.RESET_ALL}"
-            )
-
-            if not balance or balance <= amount:
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient {ticker} Token Balance{Style.RESET_ALL}"
-                )
-                continue
-
-            await self.process_perform_swap(account, address, swap_type, token_in, token_out, amount, use_proxy)
-            await self.print_timer("Transactions")
-
-    async def process_option_11(self, account: str, address: str, use_proxy: bool):
-        self.log(f"{Fore.CYAN+Style.BRIGHT}Bridge    :{Style.RESET_ALL}                                              ")
-
-        for i in range(self.bridge_count):
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT} ● {Style.RESET_ALL}"
-                f"{Fore.GREEN+Style.BRIGHT}Bridge{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {i+1} {Style.RESET_ALL}"
-                f"{Fore.MAGENTA+Style.BRIGHT}-{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {self.bridge_count} {Style.RESET_ALL}                                              "
-            )
-
-            bridge_data = self.generate_bridge_option()
-            option = bridge_data["option"]
-            rpc_url = bridge_data["rpc_url"]
-            explorer = bridge_data["explorer"]
-            amount = bridge_data["amount"]
-            src_chain_id = bridge_data["src_chain_id"]
-            dest_chain_id = bridge_data["dest_chain_id"]
-            token_type = bridge_data["src_token"]["type"]
-            src_ticker = bridge_data["src_token"]["ticker"]
-            src_address = bridge_data["src_token"]["address"]
-            dest_address = bridge_data["dest_token"]["address"]
-
-            balance = await self.get_token_balance(address, rpc_url, src_address, token_type, use_proxy)
-
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Option  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{option}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Balance : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{balance} {src_ticker}{Style.RESET_ALL}"
-            )
-            self.log(
-                f"{Fore.BLUE+Style.BRIGHT}   Amount  : {Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT}{amount} {src_ticker}{Style.RESET_ALL}"
-            )
-
-            if not balance or balance <= amount:
-                self.log(
-                    f"{Fore.BLUE+Style.BRIGHT}   Status  : {Style.RESET_ALL}"
-                    f"{Fore.YELLOW+Style.BRIGHT}Insufficient {src_ticker} Token Balance{Style.RESET_ALL}"
-                )
-                continue
-
-            await self.process_perform_bridge(account, address, rpc_url, src_chain_id, dest_chain_id, src_address, dest_address, amount, token_type, explorer, use_proxy)
-            await self.print_timer("Transactions")
-
-    async def process_check_connection(self, address: str, use_proxy: bool, rotate_proxy: bool):
+    
+    # 代理检测
+    async def process_check_connection(self, address: str, proxy_url: str):
         while True:
-            proxy = self.get_next_proxy_for_account(address) if use_proxy else None
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}Proxy     :{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {proxy} {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {proxy_url} {Style.RESET_ALL}"
             )
 
-            is_valid = await self.check_connection(proxy)
+            is_valid = await self.check_connection(proxy_url)
             if not is_valid:
-                if rotate_proxy:
-                    proxy = self.rotate_proxy_for_account(address)
-                    await asyncio.sleep(1)
-                    continue
-
-                return False
-
+                self.log(
+                    f"{Fore.CYAN+Style.BRIGHT}Proxy     :{Style.RESET_ALL}"
+                    f"{Fore.RED+Style.BRIGHT} Invalid Proxy {Style.RESET_ALL}"
+                )
+                await self.print_timer("Proxy")
             return True
         
-    async def process_user_signin(self, address: str, use_proxy: bool, rotate_proxy: bool):
-        is_valid = await self.process_check_connection(address, use_proxy, rotate_proxy)
+    # 用户登录逻辑
+    async def process_user_signin(self, address: str, proxy_url: str):
+        is_valid = await self.process_check_connection(address, proxy_url)
         if is_valid:
-            
-            signin = await self.user_signin(address, use_proxy)
+            signin = await self.user_signin(address, proxy_url)
             if signin:
                 self.access_tokens[address] = signin["data"]["access_token"]
                 self.aa_address[address] = signin["data"]["aa_address"]
@@ -2613,106 +2555,210 @@ class KiteAI:
 
             return False
         
-    async def process_accounts(self, account: str, address: str, option: int, use_proxy: bool, rotate_proxy: bool):
-        signed = await self.process_user_signin(address, use_proxy, rotate_proxy)
+    # 账号处理
+    async def process_accounts(self, account: str, address: str, proxy_url: str):
+        # 初始化账号执行报告
+        self.execution_report[address] = {
+            "username": "Unknown",
+            "status": "Failed",
+            "tasks": {},
+            "start_time": datetime.now(),
+            "end_time": None,
+            "duration": None
+        }
+        
+        signed = await self.process_user_signin(address, proxy_url)
         if signed:
+            user = await self.user_data(address, proxy_url)
 
-            user = await self.user_data(address, use_proxy)
-            if not user: return
+            if not user: 
+                self.execution_report[address]["end_time"] = datetime.now()
+                self.execution_report[address]["duration"] = self.execution_report[address]["end_time"] - self.execution_report[address]["start_time"]
+                return
             
             username = user.get("data", {}).get("profile", {}).get("username", "Unknown")
-            sa_address = user.get("data", {}).get("profile", {}).get("smart_account_address", "Undifined")
+            sa_address = user.get("data", {}).get("profile", {}).get("smart_account_address", "Undefined")
             v1_xp = user.get("data", {}).get("profile", {}).get("total_v1_xp_points", 0)
             v2_xp = user.get("data", {}).get("profile", {}).get("total_xp_points", 0)
             rank = user.get("data", {}).get("profile", {}).get("rank", 0)
             
+            # 更新报告中的用户名
+            self.execution_report[address]["username"] = username
+            
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}Username  :{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {username} {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {username} {Style.RESET_ALL}"
             )
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}SA Address:{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {self.mask_account(sa_address)} {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {self.mask_account(sa_address)} {Style.RESET_ALL}"
             )
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}V1 Points :{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {v1_xp} XP {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {v1_xp} XP {Style.RESET_ALL}"
             )
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}V2 Points :{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {v2_xp} XP {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {v2_xp} XP {Style.RESET_ALL}"
             )
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}Ranking   :{Style.RESET_ALL}"
-                f"{Fore.WHITE+Style.BRIGHT} {rank} {Style.RESET_ALL}"
+                f"{Fore.YELLOW+Style.BRIGHT} {rank} {Style.RESET_ALL}"
             )
             
-            if option == 1:
-                await self.process_option_1(address, user, use_proxy)
+            # 标记登录成功
+            self.execution_report[address]["status"] = "Success"
+            
+            # 记录任务开始
+            self.execution_report[address]["tasks"]["faucet"] = {"status": "Started", "time": datetime.now()}
+            await self.process_faucet(address, user, proxy_url)
+            self.execution_report[address]["tasks"]["faucet"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["faucet"]["end_time"] = datetime.now()
 
-            elif option == 2:
-                await self.process_option_2(account, address, use_proxy)
+            # await self.process_smart_deposit(account, address, proxy_url)， // 待定
 
-            elif option == 3:
-                await self.process_option_3(address, use_proxy)
+            # await self.process_smart_withdraw(address, proxy_url)  // 待定
 
-            elif option == 4:
-                await self.process_option_4(address, use_proxy)
+            self.execution_report[address]["tasks"]["unstake"] = {"status": "Started", "time": datetime.now()}
+            await self.process_unstake(address, proxy_url)
+            self.execution_report[address]["tasks"]["unstake"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["unstake"]["end_time"] = datetime.now()
 
-            elif option == 5:
-                await self.process_option_5(address, use_proxy)
+            await asyncio.sleep(self.min_delay)
 
-            elif option == 6:
-                await self.process_option_6(address, use_proxy)
+            self.execution_report[address]["tasks"]["stake"] = {"status": "Started", "time": datetime.now()}
+            await self.process_stake(address, proxy_url)
+            self.execution_report[address]["tasks"]["stake"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["stake"]["end_time"] = datetime.now()
 
-            elif option == 7:
-                await self.process_option_7(address, use_proxy)
+            self.execution_report[address]["tasks"]["claim_reward"] = {"status": "Started", "time": datetime.now()}
+            await self.process_claim_stake_reward(address, proxy_url)
+            self.execution_report[address]["tasks"]["claim_reward"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["claim_reward"]["end_time"] = datetime.now()
+            
+            self.execution_report[address]["tasks"]["daily_quiz"] = {"status": "Started", "time": datetime.now()}
+            await self.process_daily_quiz(address, proxy_url)
+            self.execution_report[address]["tasks"]["daily_quiz"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["daily_quiz"]["end_time"] = datetime.now()
 
-            elif option == 8:
-                await self.process_option_8(address, use_proxy)
+            self.execution_report[address]["tasks"]["ai_chat"] = {"status": "Started", "time": datetime.now()}
+            await self.process_ai_agents_chat(address, proxy_url)
+            self.execution_report[address]["tasks"]["ai_chat"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["ai_chat"]["end_time"] = datetime.now()
 
-            elif option == 9:
-                await self.process_option_9(account, address, use_proxy)
+            self.execution_report[address]["tasks"]["multisig"] = {"status": "Started", "time": datetime.now()}
+            await self.process_multisig_task(account, address, proxy_url)
+            self.execution_report[address]["tasks"]["multisig"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["multisig"]["end_time"] = datetime.now()
 
-            elif option == 10:
-                await self.process_option_10(account, address, use_proxy)
+            self.execution_report[address]["tasks"]["swap"] = {"status": "Started", "time": datetime.now()}
+            await self.process_random_swap(account, address, proxy_url)
+            self.execution_report[address]["tasks"]["swap"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["swap"]["end_time"] = datetime.now()
 
-            elif option == 11:
-                await self.process_option_11(account, address, use_proxy)
+            self.execution_report[address]["tasks"]["bridge"] = {"status": "Started", "time": datetime.now()}
+            await self.process_random_bridge(account, address, proxy_url)
+            self.execution_report[address]["tasks"]["bridge"]["status"] = "Completed"
+            self.execution_report[address]["tasks"]["bridge"]["end_time"] = datetime.now()
 
-            elif option == 12:
-                if self.auto_claim_faucet:
-                    await self.process_option_1(address, user, use_proxy)
+            # 记录结束时间和持续时间
+            self.execution_report[address]["end_time"] = datetime.now()
+            self.execution_report[address]["duration"] = self.execution_report[address]["end_time"] - self.execution_report[address]["start_time"]
+            return
 
-                if self.auto_deposit_token:
-                    await self.process_option_2(account, address, use_proxy)
-
-                if self.auto_withdraw_token:
-                    await self.process_option_3(address, use_proxy)
-
-                if self.auto_unstake_token:
-                    await self.process_option_4(address, use_proxy)
-
-                if self.auto_stake_token:
-                    await self.process_option_5(address, use_proxy)
-
-                if self.auto_claim_reward:
-                    await self.process_option_6(address, use_proxy)
-
-                if self.auto_daily_quiz:
-                    await self.process_option_7(address, use_proxy)
-
-                if self.auto_chat_ai_agent:
-                    await self.process_option_8(address, use_proxy)
-
-                if self.auto_create_multisig:
-                    await self.process_option_9(account, address, use_proxy)
-
-                if self.auto_swap_token:
-                    await self.process_option_10(account, address, use_proxy)
-
-                if self.auto_bridge_token:
-                    await self.process_option_11(account, address, use_proxy)
+    def generate_execution_report(self):
+        """生成执行报告"""
+        self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+        self.log(f"{Fore.GREEN + Style.BRIGHT}执行报告 Summary{Style.RESET_ALL}")
+        self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+        
+        total_accounts = len(self.execution_report)
+        successful_accounts = 0
+        failed_accounts = 0
+        
+        # 统计任务执行情况
+        task_stats = {}
+        
+        for address, report in self.execution_report.items():
+            if report["status"] == "Success":
+                successful_accounts += 1
+            else:
+                failed_accounts += 1
+                
+            # 统计各任务的执行情况
+            for task_name, task_info in report["tasks"].items():
+                if task_name not in task_stats:
+                    task_stats[task_name] = {"success": 0, "failed": 0}
+                
+                if task_info["status"] == "Completed":
+                    task_stats[task_name]["success"] += 1
+                else:
+                    task_stats[task_name]["failed"] += 1
+        
+        # 输出总体统计
+        self.log(f"{Fore.GREEN + Style.BRIGHT}总账号数: {Style.RESET_ALL}{Fore.YELLOW + Style.BRIGHT}{total_accounts}{Style.RESET_ALL}")
+        self.log(f"{Fore.GREEN + Style.BRIGHT}成功账号数: {Style.RESET_ALL}{Fore.YELLOW + Style.BRIGHT}{successful_accounts}{Style.RESET_ALL}")
+        self.log(f"{Fore.RED + Style.BRIGHT}失败账号数: {Style.RESET_ALL}{Fore.YELLOW + Style.BRIGHT}{failed_accounts}{Style.RESET_ALL}")
+        
+        # 输出任务统计
+        self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+        self.log(f"{Fore.GREEN + Style.BRIGHT}任务执行统计{Style.RESET_ALL}")
+        self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+        
+        task_names = {
+            "faucet": "水龙头领取",
+            "unstake": "解除质押",
+            "stake": "质押",
+            "claim_reward": "领取奖励",
+            "daily_quiz": "每日测验",
+            "ai_chat": "AI聊天",
+            "multisig": "创建多签",
+            "swap": "代币交换",
+            "bridge": "跨链桥接"
+        }
+        
+        for task_key, task_name in task_names.items():
+            if task_key in task_stats:
+                success = task_stats[task_key]["success"]
+                failed = task_stats[task_key]["failed"]
+                total = success + failed
+                success_rate = (success / total * 100) if total > 0 else 0
+                
+                self.log(f"{Fore.BLUE + Style.BRIGHT}{task_name}: {Style.RESET_ALL}"
+                        f"{Fore.GREEN + Style.BRIGHT}成功:{success} {Style.RESET_ALL}"
+                        f"{Fore.RED + Style.BRIGHT}失败:{failed} {Style.RESET_ALL}"
+                        f"{Fore.YELLOW + Style.BRIGHT}成功率:{success_rate:.2f}%{Style.RESET_ALL}")
+        
+        # 输出详细账号报告
+        self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+        self.log(f"{Fore.GREEN + Style.BRIGHT}详细账号报告{Style.RESET_ALL}")
+        self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
+        
+        for address, report in self.execution_report.items():
+            self.log(f"{Fore.YELLOW + Style.BRIGHT}账号: {self.mask_account(address)}{Style.RESET_ALL}")
+            self.log(f"  {Fore.GREEN + Style.BRIGHT}用户名: {Style.RESET_ALL}{report['username']}")
+            self.log(f"  {Fore.GREEN + Style.BRIGHT}状态: {Style.RESET_ALL}"
+                    f"{Fore.GREEN + Style.BRIGHT if report['status'] == 'Success' else Fore.RED + Style.BRIGHT}{report['status']}{Style.RESET_ALL}")
+            
+            if report['end_time']:
+                duration = report['duration']
+                minutes, seconds = divmod(duration.total_seconds(), 60)
+                self.log(f"  {Fore.GREEN + Style.BRIGHT}执行时长: {Style.RESET_ALL}{int(minutes)}分{int(seconds)}秒")
+            
+            self.log(f"  {Fore.GREEN + Style.BRIGHT}任务详情:{Style.RESET_ALL}")
+            
+            for task_name, task_info in report["tasks"].items():
+                task_display_name = task_names.get(task_name, task_name)
+                status = task_info["status"]
+                status_color = Fore.GREEN + Style.BRIGHT if status == "Completed" else Fore.RED + Style.BRIGHT
+                self.log(f"    {task_display_name}: {status_color}{status}{Style.RESET_ALL}")
+                
+                if "end_time" in task_info and task_info["end_time"]:
+                    task_duration = task_info["end_time"] - task_info["time"]
+                    minutes, seconds = divmod(task_duration.total_seconds(), 60)
+                    self.log(f"      用时: {int(minutes)}分{int(seconds)}秒")
+            
+            self.log("")
 
     async def main(self):
         try:
@@ -2730,100 +2776,141 @@ class KiteAI:
             
             self.agent_lists = agents
             
-            option, proxy_choice, rotate_proxy = self.print_question()
+            # 询问用户并发数量
+            # self.print_concurrent_question()
 
             while True:
-                use_proxy = True if proxy_choice == 1 else False
+                use_proxy = True
 
                 self.clear_terminal()
                 self.welcome()
                 self.log(
                     f"{Fore.GREEN + Style.BRIGHT}Account's Total: {Style.RESET_ALL}"
-                    f"{Fore.WHITE + Style.BRIGHT}{len(accounts)}{Style.RESET_ALL}"
+                    f"{Fore.YELLOW + Style.BRIGHT}{len(accounts)}{Style.RESET_ALL}"
+                )
+                self.log(
+                    f"{Fore.GREEN + Style.BRIGHT}Concurrent Count: {Style.RESET_ALL}"
+                    f"{Fore.YELLOW + Style.BRIGHT}{self.concurrent_count}{Style.RESET_ALL}"
                 )
 
                 if use_proxy:
                     await self.load_proxies()
                 
                 separator = "=" * 25
-                for account in accounts:
-                    if account:
-                        address = self.generate_address(account)
-                        self.log(
-                            f"{Fore.CYAN + Style.BRIGHT}{separator}[{Style.RESET_ALL}"
-                            f"{Fore.WHITE + Style.BRIGHT} {self.mask_account(address)} {Style.RESET_ALL}"
-                            f"{Fore.CYAN + Style.BRIGHT}]{separator}{Style.RESET_ALL}"
-                        )
-
-                        if not address:
+                
+                # 重置执行报告
+                self.execution_report = {}
+                
+                # 分批处理账号
+                for i in range(0, len(accounts), self.concurrent_count):
+                    batch_accounts = accounts[i:i+self.concurrent_count]
+                    tasks = []
+                    
+                    # 为每个账号创建处理任务
+                    for index, account in enumerate(batch_accounts):
+                        global_index = i + index
+                        if account:
+                            address = self.generate_address(account)
                             self.log(
-                                f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
-                                f"{Fore.RED+Style.BRIGHT} Invalid Private Key or Libraries Version Not Supported {Style.RESET_ALL}"
+                                f"{Fore.CYAN + Style.BRIGHT}{separator}[{Style.RESET_ALL}"
+                                f"{Fore.YELLOW + Style.BRIGHT}账号{global_index + 1}： {self.mask_account(address)} {Style.RESET_ALL}"
+                                f"{Fore.CYAN + Style.BRIGHT}]{separator}{Style.RESET_ALL}"
                             )
-                            continue
-                        
-                        auth_token = self.generate_auth_token(address)
-                        if not auth_token:
-                            self.log(
-                                f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
-                                f"{Fore.RED+Style.BRIGHT} Generate Auth Token Failed, Check Your Cryptography Library {Style.RESET_ALL}                  "
-                            )
-                            continue
 
-                        user_agent = FakeUserAgent().random
+                            if not address:
+                                self.log(
+                                    f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
+                                    f"{Fore.RED+Style.BRIGHT} Invalid Private Key or Libraries Version Not Supported {Style.RESET_ALL}"
+                                )
+                                continue
+                            
+                            auth_token = self.generate_auth_token(address)
+                            if not auth_token:
+                                self.log(
+                                    f"{Fore.CYAN+Style.BRIGHT}Status    :{Style.RESET_ALL}"
+                                    f"{Fore.RED+Style.BRIGHT} Generate Auth Token Failed, Check Your Cryptography Library {Style.RESET_ALL}                  "
+                                )
+                                continue
 
-                        self.FAUCET_HEADERS[address] = {
-                            "Accept-Language": "application/json, text/plain, */*",
-                            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-                            "Origin": "https://faucet.gokite.ai",
-                            "Referer": "https://faucet.gokite.ai/",
-                            "Sec-Fetch-Dest": "empty",
-                            "Sec-Fetch-Mode": "cors",
-                            "Sec-Fetch-Site": "same-origin",
-                            "User-Agent": user_agent
-                        }
+                            user_agent = FakeUserAgent().random
 
-                        self.TESTNET_HEADERS[address] = {
-                            "Accept-Language": "application/json, text/plain, */*",
-                            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-                            "Origin": "https://testnet.gokite.ai",
-                            "Referer": "https://testnet.gokite.ai/",
-                            "Sec-Fetch-Dest": "empty",
-                            "Sec-Fetch-Mode": "cors",
-                            "Sec-Fetch-Site": "same-site",
-                            "User-Agent": user_agent
-                        }
+                            self.FAUCET_HEADERS[address] = {
+                                "Accept-Language": "application/json, text/plain, */*",
+                                "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                                "Origin": "https://faucet.gokite.ai",
+                                "Referer": "https://faucet.gokite.ai/",
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-origin",
+                                "User-Agent": user_agent
+                            }
 
-                        self.BRIDGE_HEADERS[address] = {
-                            "Accept-Language": "application/json, text/plain, */*",
-                            "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-                            "Origin": "https://bridge.prod.gokite.ai",
-                            "Referer": "https://bridge.prod.gokite.ai/",
-                            "Sec-Fetch-Dest": "empty",
-                            "Sec-Fetch-Mode": "cors",
-                            "Sec-Fetch-Site": "same-site",
-                            "User-Agent": user_agent
-                        }
-                        
-                        self.auth_tokens[address] = auth_token
-                        
-                        await self.process_accounts(account, address, option, use_proxy, rotate_proxy)
-                        await asyncio.sleep(3)
+                            self.TESTNET_HEADERS[address] = {
+                                "Accept-Language": "application/json, text/plain, */*",
+                                "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                                "Origin": "https://testnet.gokite.ai",
+                                "Referer": "https://testnet.gokite.ai/",
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-site",
+                                "User-Agent": user_agent
+                            }
 
+                            self.BRIDGE_HEADERS[address] = {
+                                "Accept-Language": "application/json, text/plain, */*",
+                                "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                                "Origin": "https://bridge.prod.gokite.ai",
+                                "Referer": "https://bridge.prod.gokite.ai/",
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-site",
+                                "User-Agent": user_agent
+                            }
+
+                            self.MULTISIG_HEADERS[address] = {
+                                "Accept-Language": "*/*",
+                                "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+                                "Origin": "https://wallet.ash.center",
+                                "Referer": "https://wallet.ash.center/",
+                                "Sec-Fetch-Dest": "empty",
+                                "Sec-Fetch-Mode": "cors",
+                                "Sec-Fetch-Site": "same-site",
+                                "User-Agent": user_agent
+                            }
+                            
+                            self.auth_tokens[address] = auth_token
+                            
+                            # 创建并发任务而不是直接await
+                            proxy_url = self.proxies[global_index] if global_index < len(self.proxies) else None
+                            task = asyncio.create_task(self.process_accounts(account, address, proxy_url))
+                            tasks.append(task)
+                    
+                    # 并发执行当前批次账号的处理任务
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # 如果不是最后一批，等待10秒再处理下一批
+                    if i + self.concurrent_count < len(accounts):
+                        self.log(f"{Fore.CYAN + Style.BRIGHT}Waiting 10 seconds before processing next batch...{Style.RESET_ALL}")
+                        await asyncio.sleep(10)
+                
+                # 生成并输出执行报告
+                self.generate_execution_report()
+                
                 self.log(f"{Fore.CYAN + Style.BRIGHT}={Style.RESET_ALL}"*72)
-                seconds = 24 * 60 * 60
-                while seconds > 0:
-                    formatted_time = self.format_seconds(seconds)
-                    print(
-                        f"{Fore.CYAN+Style.BRIGHT}[ Wait for{Style.RESET_ALL}"
-                        f"{Fore.WHITE+Style.BRIGHT} {formatted_time} {Style.RESET_ALL}"
-                        f"{Fore.CYAN+Style.BRIGHT}... ]{Style.RESET_ALL}"
-                        f"{Fore.WHITE+Style.BRIGHT} | {Style.RESET_ALL}"
-                        f"{Fore.BLUE+Style.BRIGHT}All Accounts Have Been Processed.{Style.RESET_ALL}",
-                        end="\r"
-                    )
-                    await asyncio.sleep(1)
-                    seconds -= 1
+                # seconds = 24 * 60 * 60
+                # while seconds > 0:
+                #     formatted_time = self.format_seconds(seconds)
+                #     print(
+                #         f"{Fore.CYAN+Style.BRIGHT}[ Wait for{Style.RESET_ALL}"
+                #         f"{Fore.YELLOW+Style.BRIGHT} {formatted_time} {Style.RESET_ALL}"
+                #         f"{Fore.CYAN+Style.BRIGHT}... ]{Style.RESET_ALL}"
+                #         f"{Fore.YELLOW+Style.BRIGHT} | {Style.RESET_ALL}"
+                #         f"{Fore.BLUE+Style.BRIGHT}All Accounts Have Been Processed.{Style.RESET_ALL}",
+                #         end="\r"
+                #     )
+                #     await asyncio.sleep(1)
+                #     seconds -= 1
 
         except FileNotFoundError:
             self.log(f"{Fore.RED}File 'accounts.txt' Not Found.{Style.RESET_ALL}")
@@ -2832,6 +2919,22 @@ class KiteAI:
             self.log(f"{Fore.RED+Style.BRIGHT}Error: {e}{Style.RESET_ALL}")
             raise e
 
+    def print_concurrent_question(self):
+        while True:
+            try:
+                concurrent_count = int(input(f"{Fore.YELLOW + Style.BRIGHT}Enter Concurrent Count (Default is 5) -> {Style.RESET_ALL}").strip())
+                if concurrent_count > 0:
+                    self.concurrent_count = concurrent_count
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Concurrent Count must be greater than 0.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number.{Style.RESET_ALL}")
+        
+        # 如果用户没有输入并发数，默认为5
+        if not hasattr(self, 'concurrent_count'):
+            self.concurrent_count = 5
+
 if __name__ == "__main__":
     try:
         bot = KiteAI()
@@ -2839,6 +2942,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(
             f"{Fore.CYAN + Style.BRIGHT}[ {datetime.now().astimezone(wib).strftime('%x %X %Z')} ]{Style.RESET_ALL}"
-            f"{Fore.WHITE + Style.BRIGHT} | {Style.RESET_ALL}"
+            f"{Fore.YELLOW + Style.BRIGHT} | {Style.RESET_ALL}"
             f"{Fore.RED + Style.BRIGHT}[ EXIT ] Kite AI Ozone - BOT{Style.RESET_ALL}                                       "                              
         )
